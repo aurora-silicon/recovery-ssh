@@ -1,0 +1,81 @@
+#!/bin/sh
+set -eu
+
+ARCHIVE="${TMPDIR:-/tmp}/recovery-ssh-bundle.tar.gz"
+COMPUTER_NAME='@COMPUTER_NAME@'
+TRANSPORT='@TRANSPORT@'
+EXPECTED_SIZE='@ARCHIVE_SIZE@'
+EXPECTED_CKSUM='@ARCHIVE_CKSUM@'
+MARKER='__RECOVERY_SSH_ARCHIVE_BELOW__'
+
+payload_line=$(awk -v marker="$MARKER" '$0 == marker { print NR + 1; exit }' "$0")
+if [ -z "$payload_line" ]; then
+    echo "ERROR: embedded Recovery SSH payload was not found" >&2
+    exit 1
+fi
+
+tail -n "+$payload_line" "$0" > "$ARCHIVE"
+actual_size=$(wc -c < "$ARCHIVE" | tr -d ' ')
+actual_cksum=$(cksum "$ARCHIVE" | awk '{print $1}')
+if [ "$actual_size" != "$EXPECTED_SIZE" ] || [ "$actual_cksum" != "$EXPECTED_CKSUM" ]; then
+    echo "ERROR: embedded payload verification failed" >&2
+    echo "Expected cksum/size: $EXPECTED_CKSUM $EXPECTED_SIZE" >&2
+    echo "Actual cksum/size:   $actual_cksum $actual_size" >&2
+    exit 1
+fi
+
+install_to_volume()
+{
+    volume=$1
+    if [ ! -d "$volume" ] || [ ! -w "$volume" ]; then
+        return
+    fi
+
+    echo "Installing persistent launcher on $volume..."
+    tar -xzf "$ARCHIVE" -C "$volume"
+    chmod 700 "$volume/recovery-ssh" "$volume/.recovery-ssh"
+    chmod 700 "$volume/.recovery-ssh/ptywrap"
+    chmod 600 "$volume/.recovery-ssh/id_ed25519" \
+        "$volume/.recovery-ssh/id_ed25519.pub" \
+        "$volume/.recovery-ssh/known_hosts"
+    chown -R 0:0 "$volume/recovery-ssh" "$volume/.recovery-ssh" 2>/dev/null || true
+
+    if [ -z "$PRIMARY_VOLUME" ]; then
+        PRIMARY_VOLUME=$volume
+    fi
+}
+
+PRIMARY_VOLUME=
+if [ -n "${RECOVERY_SSH_VOLUME:-}" ]; then
+    install_to_volume "$RECOVERY_SSH_VOLUME"
+else
+    install_to_volume /Volumes/Data
+    for volume in /Volumes/*" - Data"; do
+        [ -d "$volume" ] || continue
+        install_to_volume "$volume"
+    done
+fi
+
+if [ -z "$PRIMARY_VOLUME" ]; then
+    echo "ERROR: no writable APFS Data volume was found" >&2
+    echo "Mount the Data volume, or set RECOVERY_SSH_VOLUME to its path." >&2
+    exit 1
+fi
+
+echo
+echo "Recovery SSH profile '$COMPUTER_NAME' is persistent on: $PRIMARY_VOLUME"
+echo "Transport: $TRANSPORT"
+echo "After each Recovery reboot, run:"
+echo "  sh '$PRIMARY_VOLUME/recovery-ssh'"
+
+if [ "${RECOVERY_SSH_REQUEST_RELOAD:-0}" = 1 ]; then
+    : > "$PRIMARY_VOLUME/.recovery-ssh/reload"
+fi
+
+if [ "${RECOVERY_SSH_INSTALL_ONLY:-0}" = 1 ]; then
+    exit 0
+fi
+
+exec sh "$PRIMARY_VOLUME/recovery-ssh"
+exit 0
+__RECOVERY_SSH_ARCHIVE_BELOW__

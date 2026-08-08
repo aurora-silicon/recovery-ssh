@@ -1,0 +1,952 @@
+#!/bin/sh
+set -eu
+
+PROJECT_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+BASE_STATE_DIR=${RECOVERY_SSH_HOME:-"$HOME/.recovery-ssh"}
+PROFILE_NAME=default
+STATE_DIR=
+CONFIG=
+AUTHORIZED_KEYS_OVERRIDDEN=${RECOVERY_SSH_AUTHORIZED_KEYS+yes}
+AUTHORIZED_KEYS=${RECOVERY_SSH_AUTHORIZED_KEYS:-"$HOME/.ssh/authorized_keys"}
+MARKER=
+LEGACY_MARKER='recovery-ssh-controller'
+
+CONTROLLER_HOST=
+CONTROLLER_USER=$(id -un)
+TRANSPORT=lan
+USB_INTERFACE=
+LAN_HOST=
+USB_HOST=
+HOST_WAS_SET=no
+LAN_HOST_WAS_SET=no
+USB_HOST_WAS_SET=no
+LISTEN_PORT=
+HTTP_PORT=
+TOKEN=
+HOST_KEY_FILE=
+HTTP_PID=
+
+usage()
+{
+    cat <<'EOF'
+Usage: ./recovery-ssh COMMAND [OPTIONS]
+
+Commands:
+  start      Prepare, serve the installer, wait, and attach
+  setup      Generate the dedicated key, bundle, and installer
+  serve      Prepare and serve the installer until interrupted
+  connect    Attach to the loopback-only Recovery shell
+  update     Push the latest build through a connected Recovery shell
+  status     Show one computer's configuration and readiness
+  list       List every configured Recovery computer
+  usb-list   List active Mac USB-NCM links on the controller
+  doctor     Check required macOS tools
+  help       Show this help
+
+Computer selection:
+  --name NAME             Named Mac profile (default: default)
+
+Additional options for setup, start, and serve:
+  --transport MODE         lan, usb, or auto (USB preferred, LAN fallback)
+  --usb-interface NAME    Controller USB-NCM interface (auto-detected)
+  --host ADDRESS          Controller address reachable from Recovery
+  --lan-host ADDRESS      Controller Wi-Fi/Ethernet address for auto mode
+  --usb-host ADDRESS      Controller USB link-local address for auto mode
+  --user USER             Controller Remote Login user
+  --listen-port PORT      Per-computer loopback shell port
+  --http-port PORT        Per-computer installer HTTP port
+  --host-key-file PATH    Use an existing known_hosts file
+
+Named profiles get separate keys, installers, and ports under
+~/.recovery-ssh/computers/NAME. Set RECOVERY_SSH_HOME to override the base.
+EOF
+}
+
+die()
+{
+    echo "ERROR: $*" >&2
+    exit 1
+}
+
+need_command()
+{
+    command -v "$1" >/dev/null 2>&1 || die "required command is missing: $1"
+}
+
+validate_name()
+{
+    value=$1
+    label=$2
+    case "$value" in
+        ''|*[!A-Za-z0-9._-]*) die "invalid $label: $value" ;;
+    esac
+}
+
+validate_port()
+{
+    value=$1
+    label=$2
+    case "$value" in
+        ''|*[!0-9]*) die "invalid $label: $value" ;;
+    esac
+    [ "$value" -ge 1 ] && [ "$value" -le 65535 ] ||
+        die "$label must be between 1 and 65535"
+}
+
+detect_controller_host()
+{
+    interface=$(/sbin/route -n get default 2>/dev/null |
+        awk '/interface:/{print $2; exit}')
+    if [ -n "$interface" ]; then
+        address=$(/usr/sbin/ipconfig getifaddr "$interface" 2>/dev/null || true)
+        if [ -n "$address" ]; then
+            echo "$address"
+            return
+        fi
+    fi
+
+    local_name=$(/usr/sbin/scutil --get LocalHostName 2>/dev/null || true)
+    if [ -n "$local_name" ]; then
+        echo "${local_name}.local"
+        return
+    fi
+    hostname
+}
+
+usb_interface_address()
+{
+    interface=$1
+    /sbin/ifconfig "$interface" 2>/dev/null |
+        awk '/^[[:space:]]*inet / {print $2; exit}'
+}
+
+mac_usb_interfaces()
+{
+    mac_products=$(
+        ioreg -r -c IOUSBHostDevice -l -w 0 2>/dev/null |
+            awk '
+                /^\+-o / {
+                    if (is_mac && product != "") print product
+                    is_mac=0
+                    product=""
+                }
+                /"USB Product Name" = "Mac"/ {is_mac=1}
+                /"idProduct" = / {product=$NF}
+                END {if (is_mac && product != "") print product}
+            ' | sort -u
+    )
+
+    for product in $mac_products; do
+        ioreg -r -c AppleUSBNCMData -l -w 0 2>/dev/null |
+            awk -v wanted="$product" '
+                /^\+-o / {product=""}
+                /"idProduct" = / {product=$NF}
+                /\+-o en[0-9]+ / && product == wanted {print $2}
+            '
+    done | sort -u
+}
+
+detect_usb_interface()
+{
+    candidates=$(mac_usb_interfaces)
+    active=
+    for interface in $candidates; do
+        address=$(usb_interface_address "$interface")
+        if [ -n "$address" ] &&
+            /sbin/ifconfig "$interface" 2>/dev/null | grep -q 'status: active'; then
+            if [ -n "$active" ]; then
+                die "multiple active USB-NCM Mac links found ($active, $interface); use --usb-interface"
+            fi
+            active=$interface
+        fi
+    done
+    [ -n "$active" ] ||
+        die "no active Mac USB-NCM link found; connect the Recovery Mac or use --host with --transport usb"
+    echo "$active"
+}
+
+select_profile_from_args()
+{
+    while [ "$#" -gt 0 ]; do
+        if [ "$1" = --name ]; then
+            [ "$#" -ge 2 ] || die "--name needs a value"
+            PROFILE_NAME=$2
+            shift 2
+        else
+            shift
+        fi
+    done
+    validate_name "$PROFILE_NAME" "computer name"
+}
+
+initialize_profile_state()
+{
+    # Keep a legacy single-computer state usable as the default profile.
+    if [ "$PROFILE_NAME" = default ] &&
+        [ -r "$BASE_STATE_DIR/config" ] &&
+        [ ! -r "$BASE_STATE_DIR/computers/default/config" ]; then
+        STATE_DIR=$BASE_STATE_DIR
+    else
+        STATE_DIR="$BASE_STATE_DIR/computers/$PROFILE_NAME"
+    fi
+    CONFIG="$STATE_DIR/config"
+    MARKER="recovery-ssh-controller:$PROFILE_NAME"
+}
+
+configured_port_is_used()
+{
+    variable=$1
+    port=$2
+
+    if [ -r "$BASE_STATE_DIR/config" ] && [ "$BASE_STATE_DIR/config" != "$CONFIG" ] &&
+        grep -q "^${variable}='${port}'$" "$BASE_STATE_DIR/config"; then
+        return 0
+    fi
+
+    for profile_config in "$BASE_STATE_DIR"/computers/*/config; do
+        [ -r "$profile_config" ] || continue
+        [ "$profile_config" = "$CONFIG" ] && continue
+        if grep -q "^${variable}='${port}'$" "$profile_config"; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+configured_any_port_is_used()
+{
+    port=$1
+    configured_port_is_used LISTEN_PORT "$port" ||
+        configured_port_is_used HTTP_PORT "$port"
+}
+
+allocate_port()
+{
+    candidate=$1
+    while configured_any_port_is_used "$candidate"; do
+        candidate=$((candidate + 1))
+        [ "$candidate" -le 65535 ] || die "no free configured ports remain"
+    done
+    echo "$candidate"
+}
+
+apply_profile_defaults()
+{
+    if [ -z "$LISTEN_PORT" ]; then
+        if [ "$PROFILE_NAME" = default ]; then
+            LISTEN_PORT=2222
+        else
+            LISTEN_PORT=$(allocate_port 2223)
+        fi
+    fi
+    if [ -z "$HTTP_PORT" ]; then
+        if [ "$PROFILE_NAME" = default ]; then
+            HTTP_PORT=8765
+        else
+            HTTP_PORT=$(allocate_port 8766)
+        fi
+    fi
+}
+
+load_config()
+{
+    if [ -r "$CONFIG" ]; then
+        # The file is generated by this program from validated values.
+        # shellcheck disable=SC1090
+        . "$CONFIG"
+    fi
+}
+
+parse_options()
+{
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --name)
+                [ "$#" -ge 2 ] || die "--name needs a value"
+                [ "$2" = "$PROFILE_NAME" ] || die "computer profile changed after initialization"
+                shift 2
+                ;;
+            --host)
+                [ "$#" -ge 2 ] || die "--host needs a value"
+                CONTROLLER_HOST=$2
+                HOST_WAS_SET=yes
+                shift 2
+                ;;
+            --lan-host)
+                [ "$#" -ge 2 ] || die "--lan-host needs a value"
+                LAN_HOST=$2
+                LAN_HOST_WAS_SET=yes
+                shift 2
+                ;;
+            --usb-host)
+                [ "$#" -ge 2 ] || die "--usb-host needs a value"
+                USB_HOST=$2
+                USB_HOST_WAS_SET=yes
+                shift 2
+                ;;
+            --transport)
+                [ "$#" -ge 2 ] || die "--transport needs a value"
+                TRANSPORT=$2
+                if [ "$HOST_WAS_SET" != yes ]; then
+                    CONTROLLER_HOST=
+                fi
+                if [ "$TRANSPORT" = lan ]; then
+                    USB_INTERFACE=
+                    USB_HOST=
+                elif [ "$TRANSPORT" = usb ]; then
+                    LAN_HOST=
+                fi
+                shift 2
+                ;;
+            --usb-interface)
+                [ "$#" -ge 2 ] || die "--usb-interface needs a value"
+                USB_INTERFACE=$2
+                shift 2
+                ;;
+            --user)
+                [ "$#" -ge 2 ] || die "--user needs a value"
+                CONTROLLER_USER=$2
+                shift 2
+                ;;
+            --listen-port)
+                [ "$#" -ge 2 ] || die "--listen-port needs a value"
+                LISTEN_PORT=$2
+                shift 2
+                ;;
+            --http-port)
+                [ "$#" -ge 2 ] || die "--http-port needs a value"
+                HTTP_PORT=$2
+                shift 2
+                ;;
+            --host-key-file)
+                [ "$#" -ge 2 ] || die "--host-key-file needs a value"
+                HOST_KEY_FILE=$2
+                shift 2
+                ;;
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            *) die "unknown option: $1" ;;
+        esac
+    done
+}
+
+parse_profile_only()
+{
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --name)
+                [ "$#" -ge 2 ] || die "--name needs a value"
+                [ "$2" = "$PROFILE_NAME" ] || die "computer profile changed after initialization"
+                shift 2
+                ;;
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            *) die "this command only accepts --name NAME" ;;
+        esac
+    done
+}
+
+validate_config()
+{
+    validate_name "$PROFILE_NAME" "computer name"
+    case "$TRANSPORT" in
+        lan)
+            [ -z "$USB_INTERFACE" ] ||
+                die "--usb-interface requires --transport usb"
+            if [ "$LAN_HOST_WAS_SET" = yes ]; then
+                CONTROLLER_HOST=$LAN_HOST
+            elif [ "$HOST_WAS_SET" != yes ]; then
+                CONTROLLER_HOST=$(detect_controller_host)
+                LAN_HOST=$CONTROLLER_HOST
+            else
+                LAN_HOST=$CONTROLLER_HOST
+            fi
+            ;;
+        usb)
+            if [ "$USB_HOST_WAS_SET" = yes ]; then
+                CONTROLLER_HOST=$USB_HOST
+            elif [ "$HOST_WAS_SET" != yes ]; then
+                [ -n "$USB_INTERFACE" ] || USB_INTERFACE=$(detect_usb_interface)
+                validate_name "$USB_INTERFACE" "USB interface"
+                CONTROLLER_HOST=$(usb_interface_address "$USB_INTERFACE")
+                USB_HOST=$CONTROLLER_HOST
+                [ -n "$CONTROLLER_HOST" ] ||
+                    die "USB interface $USB_INTERFACE has no IPv4 address"
+            elif [ -n "$USB_INTERFACE" ]; then
+                validate_name "$USB_INTERFACE" "USB interface"
+                USB_HOST=$CONTROLLER_HOST
+            else
+                USB_HOST=$CONTROLLER_HOST
+            fi
+            ;;
+        auto)
+            if [ "$USB_HOST_WAS_SET" != yes ]; then
+                [ -n "$USB_INTERFACE" ] || USB_INTERFACE=$(detect_usb_interface)
+                validate_name "$USB_INTERFACE" "USB interface"
+                USB_HOST=$(usb_interface_address "$USB_INTERFACE")
+                [ -n "$USB_HOST" ] ||
+                    die "USB interface $USB_INTERFACE has no IPv4 address"
+            fi
+            if [ "$LAN_HOST_WAS_SET" != yes ]; then
+                if [ "$HOST_WAS_SET" = yes ]; then
+                    LAN_HOST=$CONTROLLER_HOST
+                else
+                    LAN_HOST=$(detect_controller_host)
+                fi
+            fi
+            CONTROLLER_HOST=$USB_HOST
+            ;;
+        *) die "transport must be lan, usb, or auto" ;;
+    esac
+    validate_name "$CONTROLLER_HOST" "controller host"
+    [ -z "$LAN_HOST" ] || validate_name "$LAN_HOST" "LAN host"
+    [ -z "$USB_HOST" ] || validate_name "$USB_HOST" "USB host"
+    [ -z "$USB_INTERFACE" ] || validate_name "$USB_INTERFACE" "USB interface"
+    validate_name "$CONTROLLER_USER" "controller user"
+    validate_port "$LISTEN_PORT" "listen port"
+    validate_port "$HTTP_PORT" "HTTP port"
+    [ "$LISTEN_PORT" != "$HTTP_PORT" ] ||
+        die "listen port and HTTP port must be different"
+    if configured_any_port_is_used "$LISTEN_PORT"; then
+        die "port $LISTEN_PORT is assigned to another computer profile"
+    fi
+    if configured_any_port_is_used "$HTTP_PORT"; then
+        die "port $HTTP_PORT is assigned to another computer profile"
+    fi
+
+    if [ "$CONTROLLER_USER" != "$(id -un)" ] &&
+        [ "$AUTHORIZED_KEYS_OVERRIDDEN" != yes ]; then
+        die "--user must be the current user unless RECOVERY_SSH_AUTHORIZED_KEYS points to that user's authorized_keys file"
+    fi
+}
+
+ensure_helpers()
+{
+    if [ -x "$PROJECT_ROOT/dist/ptywrap" ] &&
+        [ -x "$PROJECT_ROOT/dist/httpd" ]; then
+        return
+    fi
+
+    need_command xcrun
+    need_command make
+    echo "Building universal helper binaries..."
+    make -C "$PROJECT_ROOT" release
+}
+
+ensure_key()
+{
+    mkdir -p "$STATE_DIR"
+    chmod 700 "$STATE_DIR"
+    if [ ! -r "$STATE_DIR/id_ed25519" ]; then
+        echo "Generating a dedicated restricted Recovery key..."
+        /usr/bin/ssh-keygen -q -t ed25519 -N '' \
+            -C "$MARKER" -f "$STATE_DIR/id_ed25519"
+    fi
+    chmod 600 "$STATE_DIR/id_ed25519"
+    chmod 644 "$STATE_DIR/id_ed25519.pub"
+}
+
+install_authorized_key()
+{
+    ssh_dir=$(dirname "$AUTHORIZED_KEYS")
+    mkdir -p "$ssh_dir"
+    chmod 700 "$ssh_dir"
+    touch "$AUTHORIZED_KEYS"
+    chmod 600 "$AUTHORIZED_KEYS"
+
+    public_key=$(awk '{print $1 " " $2; exit}' "$STATE_DIR/id_ed25519.pub")
+    forced_command="/usr/bin/nc -l 127.0.0.1 $LISTEN_PORT"
+    key_line="restrict,command=\"$forced_command\" $public_key $MARKER"
+
+    temp_keys=$(mktemp "${AUTHORIZED_KEYS}.XXXXXX")
+    trap 'rm -f "$temp_keys"' EXIT HUP INT TERM
+    awk -v marker="$MARKER" -v legacy="$LEGACY_MARKER" -v profile="$PROFILE_NAME" \
+        '$NF != marker && !(profile == "default" && $NF == legacy)' \
+        "$AUTHORIZED_KEYS" > "$temp_keys"
+    printf '%s\n' "$key_line" >> "$temp_keys"
+    chmod 600 "$temp_keys"
+    mv "$temp_keys" "$AUTHORIZED_KEYS"
+    trap - EXIT HUP INT TERM
+}
+
+pin_controller_host()
+{
+    destination="$STATE_DIR/known_hosts"
+    temp_hosts="$STATE_DIR/known_hosts.tmp"
+    rm -f "$temp_hosts"
+
+    if [ -n "$HOST_KEY_FILE" ]; then
+        [ -s "$HOST_KEY_FILE" ] || die "host-key file is empty or missing: $HOST_KEY_FILE"
+        cp "$HOST_KEY_FILE" "$temp_hosts"
+    else
+        : > "$temp_hosts"
+        for host in $(profile_hosts); do
+            echo "Pinning SSH host keys for $host..."
+            scanned="$STATE_DIR/known_hosts.scan"
+            /usr/bin/ssh-keyscan -T 5 "$host" > "$scanned" 2>/dev/null || true
+            if [ ! -s "$scanned" ]; then
+                rm -f "$temp_hosts" "$scanned"
+                die "could not read the controller SSH host key at $host. Enable Remote Login and verify the endpoint"
+            fi
+            cat "$scanned" >> "$temp_hosts"
+            rm -f "$scanned"
+        done
+    fi
+
+    chmod 600 "$temp_hosts"
+    mv "$temp_hosts" "$destination"
+}
+
+profile_hosts()
+{
+    case "$TRANSPORT" in
+        lan) echo "$LAN_HOST" ;;
+        usb) echo "$USB_HOST" ;;
+        auto)
+            echo "$USB_HOST"
+            [ "$LAN_HOST" = "$USB_HOST" ] || echo "$LAN_HOST"
+            ;;
+    esac
+}
+
+new_token()
+{
+    /usr/bin/uuidgen | tr -d '-' | tr 'A-Z' 'a-z'
+}
+
+write_config()
+{
+    [ -n "$TOKEN" ] || TOKEN=$(new_token)
+    {
+        printf "TRANSPORT='%s'\n" "$TRANSPORT"
+        printf "USB_INTERFACE='%s'\n" "$USB_INTERFACE"
+        printf "LAN_HOST='%s'\n" "$LAN_HOST"
+        printf "USB_HOST='%s'\n" "$USB_HOST"
+        printf "CONTROLLER_HOST='%s'\n" "$CONTROLLER_HOST"
+        printf "CONTROLLER_USER='%s'\n" "$CONTROLLER_USER"
+        printf "LISTEN_PORT='%s'\n" "$LISTEN_PORT"
+        printf "HTTP_PORT='%s'\n" "$HTTP_PORT"
+        printf "TOKEN='%s'\n" "$TOKEN"
+    } > "$CONFIG"
+    chmod 600 "$CONFIG"
+}
+
+render_bundle()
+{
+    staging="$STATE_DIR/staging"
+    archive="$STATE_DIR/recovery-ssh-bundle.tar.gz"
+    installer="$STATE_DIR/install.sh"
+
+    rm -rf "$staging"
+    mkdir -p "$staging/.recovery-ssh"
+
+    sed \
+        -e "s|@COMPUTER_NAME@|$PROFILE_NAME|g" \
+        -e "s|@TRANSPORT@|$TRANSPORT|g" \
+        -e "s|@USB_INTERFACE@|$USB_INTERFACE|g" \
+        -e "s|@LAN_HOST@|$LAN_HOST|g" \
+        -e "s|@USB_HOST@|$USB_HOST|g" \
+        -e "s|@CONTROLLER_HOST@|$CONTROLLER_HOST|g" \
+        -e "s|@CONTROLLER_USER@|$CONTROLLER_USER|g" \
+        "$PROJECT_ROOT/templates/launcher.sh.in" > "$staging/recovery-ssh"
+    cp "$STATE_DIR/id_ed25519" "$staging/.recovery-ssh/id_ed25519"
+    cp "$STATE_DIR/id_ed25519.pub" "$staging/.recovery-ssh/id_ed25519.pub"
+    cp "$STATE_DIR/known_hosts" "$staging/.recovery-ssh/known_hosts"
+    cp "$PROJECT_ROOT/dist/ptywrap" "$staging/.recovery-ssh/ptywrap"
+
+    chmod 700 "$staging/recovery-ssh" "$staging/.recovery-ssh" \
+        "$staging/.recovery-ssh/ptywrap"
+    chmod 600 "$staging/.recovery-ssh/id_ed25519" \
+        "$staging/.recovery-ssh/known_hosts"
+    chmod 644 "$staging/.recovery-ssh/id_ed25519.pub"
+
+    tar -czf "$archive" -C "$staging" .
+    archive_size=$(wc -c < "$archive" | tr -d ' ')
+    archive_cksum=$(cksum "$archive" | awk '{print $1}')
+
+    sed \
+        -e "s|@COMPUTER_NAME@|$PROFILE_NAME|g" \
+        -e "s|@TRANSPORT@|$TRANSPORT|g" \
+        -e "s|@ARCHIVE_SIZE@|$archive_size|g" \
+        -e "s|@ARCHIVE_CKSUM@|$archive_cksum|g" \
+        "$PROJECT_ROOT/templates/install.sh.in" > "$installer"
+    cat "$archive" >> "$installer"
+    chmod 700 "$installer"
+}
+
+setup_controller()
+{
+    validate_config
+    ensure_helpers
+    need_command ssh-keygen
+    need_command ssh-keyscan
+    ensure_key
+    install_authorized_key
+    pin_controller_host
+    write_config
+    render_bundle
+
+    echo
+    echo "Recovery SSH is prepared."
+    echo "Computer: $PROFILE_NAME"
+    echo "Transport: $TRANSPORT${USB_INTERFACE:+ ($USB_INTERFACE)}"
+    if [ "$TRANSPORT" = auto ]; then
+        echo "USB endpoint: $USB_HOST"
+        echo "LAN endpoint: $LAN_HOST"
+    fi
+    echo "State: $STATE_DIR"
+    print_recovery_command
+}
+
+print_recovery_command()
+{
+    echo "Run this once in Recovery Terminal for '$PROFILE_NAME':"
+    if [ "$TRANSPORT" = auto ]; then
+        echo "  USB: curl -fL 'http://${USB_HOST}:${HTTP_PORT}/${TOKEN}' -o /tmp/recovery-ssh-install && sh /tmp/recovery-ssh-install"
+        echo "  LAN: curl -fL 'http://${LAN_HOST}:${HTTP_PORT}/${TOKEN}' -o /tmp/recovery-ssh-install && sh /tmp/recovery-ssh-install"
+    else
+        echo "  curl -fL 'http://${CONTROLLER_HOST}:${HTTP_PORT}/${TOKEN}' -o /tmp/recovery-ssh-install && sh /tmp/recovery-ssh-install"
+    fi
+}
+
+tcp_listener_is_active()
+{
+    port=$1
+    /usr/sbin/lsof -nP -a -iTCP:"$port" -sTCP:LISTEN 2>/dev/null |
+        awk 'NR > 1 {found=1} END {exit !found}'
+}
+
+listener_is_active()
+{
+    tcp_listener_is_active "$LISTEN_PORT"
+}
+
+http_port_is_active()
+{
+    tcp_listener_is_active "$HTTP_PORT"
+}
+
+start_http_server()
+{
+    http_port_is_active && die "HTTP port $HTTP_PORT is already in use"
+    case "$TRANSPORT" in
+        auto) short_host=$LAN_HOST ;;
+        *) short_host=$CONTROLLER_HOST ;;
+    esac
+    short_installer_url="http://${short_host}:${HTTP_PORT}/${TOKEN}"
+    "$PROJECT_ROOT/dist/httpd" 0.0.0.0 "$HTTP_PORT" "/$TOKEN" \
+        "$STATE_DIR/install.sh" "$short_installer_url" &
+    HTTP_PID=$!
+    sleep 1
+    kill -0 "$HTTP_PID" 2>/dev/null || die "installer HTTP server failed to start"
+}
+
+stop_http_server()
+{
+    if [ -n "$HTTP_PID" ]; then
+        kill "$HTTP_PID" 2>/dev/null || true
+        wait "$HTTP_PID" 2>/dev/null || true
+        HTTP_PID=
+    fi
+}
+
+run_start()
+{
+    listener_is_active &&
+        die "listen port $LISTEN_PORT is already occupied; use connect or close the stale listener"
+
+    setup_controller
+    start_http_server
+    trap 'stop_http_server' EXIT HUP INT TERM
+
+    echo
+    print_recovery_command
+    echo
+    echo "Waiting for the Recovery Mac..."
+    while ! listener_is_active; do
+        kill -0 "$HTTP_PID" 2>/dev/null || die "installer HTTP server stopped unexpectedly"
+        sleep 1
+    done
+
+    stop_http_server
+    trap - EXIT HUP INT TERM
+    echo "Recovery connected. Attaching interactive shell..."
+    run_connect
+}
+
+run_serve()
+{
+    setup_controller
+    start_http_server
+    trap 'stop_http_server' EXIT HUP INT TERM
+    echo
+    print_recovery_command
+    echo "Press Control-C after the Recovery installer has downloaded."
+    wait "$HTTP_PID"
+}
+
+run_connect()
+{
+    [ -r "$CONFIG" ] || die "computer profile '$PROFILE_NAME' is not configured"
+    trap 'exit 130' INT
+    trap 'exit 143' HUP TERM
+
+    echo "Waiting for '$PROFILE_NAME' Recovery shell on 127.0.0.1:$LISTEN_PORT..."
+    while :; do
+        while ! listener_is_active; do
+            sleep 1
+        done
+
+        echo "Recovery connected. Attaching interactive shell..."
+        /usr/bin/nc 127.0.0.1 "$LISTEN_PORT" || true
+        echo
+        echo "Recovery link disconnected; waiting to reattach..."
+        sleep 1
+    done
+}
+
+run_update()
+{
+    [ -r "$CONFIG" ] || die "computer profile '$PROFILE_NAME' is not configured"
+    listener_is_active ||
+        die "run the persistent Recovery launcher first: sh /Volumes/Data/recovery-ssh"
+
+    render_bundle
+    start_http_server
+    trap 'stop_http_server' EXIT HUP INT TERM
+
+    installer=/tmp/recovery-ssh-install
+    marker=__RECOVERY_SSH_UPDATE_OK__
+    update_log="$STATE_DIR/update.log"
+    rm -f "$update_log"
+
+    case "$TRANSPORT" in
+        auto)
+            fetch="(curl -fL 'http://${USB_HOST}:${HTTP_PORT}/${TOKEN}' -o '$installer' || curl -fL 'http://${LAN_HOST}:${HTTP_PORT}/${TOKEN}' -o '$installer')"
+            ;;
+        *)
+            fetch="curl -fL 'http://${CONTROLLER_HOST}:${HTTP_PORT}/${TOKEN}' -o '$installer'"
+            ;;
+    esac
+
+    echo "Pushing the latest Recovery SSH build to '$PROFILE_NAME'..."
+    {
+        printf '\n'
+        sleep 1
+        printf "%s && RECOVERY_SSH_REQUEST_RELOAD=1 RECOVERY_SSH_INSTALL_ONLY=1 sh '%s' && printf '\\n%s\\n'; exit\n" \
+            "$fetch" "$installer" "$marker"
+        sleep 5
+    } | /usr/bin/nc 127.0.0.1 "$LISTEN_PORT" \
+        > "$update_log" 2>&1 || true
+
+    stop_http_server
+    trap - EXIT HUP INT TERM
+    cat "$update_log"
+    if tr -d '\r' < "$update_log" | grep -qx "$marker"; then
+        echo
+        echo "Recovery SSH was updated in place."
+        echo "Relaunch it with the same short command:"
+        echo "  sh /Volumes/Data/recovery-ssh"
+    else
+        die "Recovery did not confirm the update; see $update_log"
+    fi
+}
+
+run_status()
+{
+    if [ ! -r "$CONFIG" ]; then
+        echo "Computer profile '$PROFILE_NAME' is not configured."
+        return 1
+    fi
+    echo "Computer:         $PROFILE_NAME"
+    echo "State directory:   $STATE_DIR"
+    echo "Controller:        ${CONTROLLER_USER}@${CONTROLLER_HOST}"
+    echo "Transport:         $TRANSPORT${USB_INTERFACE:+ ($USB_INTERFACE)}"
+    if [ "$TRANSPORT" = auto ]; then
+        echo "USB endpoint:      $USB_HOST"
+        echo "LAN endpoint:      $LAN_HOST"
+    fi
+    echo "Recovery listener: 127.0.0.1:$LISTEN_PORT"
+    echo "Installer URL port: $HTTP_PORT"
+
+    if [ -r "$STATE_DIR/id_ed25519" ]; then
+        echo "Dedicated key:     ready"
+    else
+        echo "Dedicated key:     not generated"
+    fi
+    if grep -q " $MARKER$" "$AUTHORIZED_KEYS" 2>/dev/null ||
+        { [ "$PROFILE_NAME" = default ] &&
+          grep -q " $LEGACY_MARKER$" "$AUTHORIZED_KEYS" 2>/dev/null; }; then
+        echo "Restricted key:    installed"
+    else
+        echo "Restricted key:    not installed"
+    fi
+    if listener_is_active; then
+        echo "Recovery shell:    waiting"
+    else
+        echo "Recovery shell:    disconnected"
+    fi
+}
+
+print_profile_row()
+(
+    row_name=$1
+    row_config=$2
+    PROFILE_NAME=$row_name
+    TRANSPORT=lan
+    USB_INTERFACE=
+    CONTROLLER_HOST='?'
+    LISTEN_PORT='?'
+    # Generated, validated local configuration.
+    # shellcheck disable=SC1090
+    . "$row_config"
+
+    connection=offline
+    if [ "$LISTEN_PORT" != '?' ] && tcp_listener_is_active "$LISTEN_PORT"; then
+        connection=waiting
+    fi
+    transport_label=$TRANSPORT
+    if [ -n "$USB_INTERFACE" ]; then
+        transport_label="${TRANSPORT}:${USB_INTERFACE}"
+    fi
+    printf '%-18s %-14s %-18s %-7s %s\n' \
+        "$row_name" "$transport_label" "$CONTROLLER_HOST" "$LISTEN_PORT" "$connection"
+)
+
+run_list()
+{
+    printf '%-18s %-14s %-18s %-7s %s\n' \
+        NAME TRANSPORT CONTROLLER PORT STATE
+    found=0
+
+    if [ -r "$BASE_STATE_DIR/config" ] &&
+        [ ! -r "$BASE_STATE_DIR/computers/default/config" ]; then
+        print_profile_row default "$BASE_STATE_DIR/config"
+        found=1
+    fi
+
+    for profile_config in "$BASE_STATE_DIR"/computers/*/config; do
+        [ -r "$profile_config" ] || continue
+        profile_dir=$(dirname "$profile_config")
+        profile_name=$(basename "$profile_dir")
+        print_profile_row "$profile_name" "$profile_config"
+        found=1
+    done
+
+    if [ "$found" -eq 0 ]; then
+        echo "No Recovery computers are configured."
+    fi
+}
+
+run_usb_list()
+{
+    printf '%-10s %-16s %s\n' INTERFACE ADDRESS STATE
+    found=0
+    interfaces=$(
+        mac_usb_interfaces
+    )
+    for interface in $interfaces; do
+        address=$(usb_interface_address "$interface")
+        [ -n "$address" ] || address='-'
+        state=inactive
+        if /sbin/ifconfig "$interface" 2>/dev/null | grep -q 'status: active'; then
+            state=active
+        fi
+        printf '%-10s %-16s %s\n' "$interface" "$address" "$state"
+        found=1
+    done
+    if [ "$found" -eq 0 ]; then
+        echo "No Mac USB-NCM links detected."
+    fi
+}
+
+run_doctor()
+{
+    failures=0
+    if [ "$(uname -s)" != Darwin ]; then
+        echo "FAIL  controller is not running macOS"
+        failures=$((failures + 1))
+    else
+        echo "OK    macOS controller"
+    fi
+
+    for command in ssh ssh-keygen ssh-keyscan nc tar cksum lsof uuidgen ioreg ifconfig; do
+        if command -v "$command" >/dev/null 2>&1; then
+            echo "OK    $command"
+        else
+            echo "FAIL  $command is missing"
+            failures=$((failures + 1))
+        fi
+    done
+
+    if [ -x "$PROJECT_ROOT/dist/ptywrap" ] &&
+        [ -x "$PROJECT_ROOT/dist/httpd" ]; then
+        echo "OK    bundled helper binaries"
+    elif command -v xcrun >/dev/null 2>&1 && command -v make >/dev/null 2>&1; then
+        echo "OK    helpers can be built with Xcode Command Line Tools"
+    else
+        echo "FAIL  helper binaries and build tools are missing"
+        failures=$((failures + 1))
+    fi
+
+    [ "$failures" -eq 0 ] || exit 1
+}
+
+COMMAND=${1:-help}
+if [ "$#" -gt 0 ]; then
+    shift
+fi
+select_profile_from_args "$@"
+initialize_profile_state
+load_config
+apply_profile_defaults
+
+case "$COMMAND" in
+    start)
+        parse_options "$@"
+        run_start
+        ;;
+    setup)
+        parse_options "$@"
+        setup_controller
+        ;;
+    serve)
+        parse_options "$@"
+        run_serve
+        ;;
+    connect)
+        parse_profile_only "$@"
+        run_connect
+        ;;
+    update)
+        parse_profile_only "$@"
+        run_update
+        ;;
+    status)
+        parse_profile_only "$@"
+        run_status
+        ;;
+    list)
+        [ "$#" -eq 0 ] || die "list does not accept options"
+        run_list
+        ;;
+    usb-list)
+        [ "$#" -eq 0 ] || die "usb-list does not accept options"
+        run_usb_list
+        ;;
+    doctor)
+        [ "$#" -eq 0 ] || die "doctor does not accept options"
+        run_doctor
+        ;;
+    help|-h|--help)
+        usage
+        ;;
+    *)
+        usage >&2
+        die "unknown command: $COMMAND"
+        ;;
+esac
