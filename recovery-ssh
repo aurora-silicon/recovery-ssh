@@ -634,7 +634,9 @@ start_http_server()
 {
     http_port_is_active && die "HTTP port $HTTP_PORT is already in use"
     case "$TRANSPORT" in
-        auto) short_host=$LAN_HOST ;;
+        # Auto mode is USB-primary. Keep the short bootstrap on USB as well;
+        # the installed launcher retains LAN as its runtime fallback.
+        auto) short_host=$USB_HOST ;;
         *) short_host=$CONTROLLER_HOST ;;
     esac
     short_installer_url="http://${short_host}:${HTTP_PORT}/${TOKEN}"
