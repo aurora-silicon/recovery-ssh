@@ -187,7 +187,10 @@ curl CONTROLLER:PORT/r | sh
 - Its `authorized_keys` entry is restricted to a forced, loopback-only `nc`
   listener. It cannot request a controller shell, PTY, agent forwarding, or port
   forwarding.
-- Controller host keys are pinned before the bundle is created.
+- Controller host keys are pinned before the bundle is created. The launcher
+  uses `accept-new` against only that dedicated file so Recovery OpenSSH can
+  record a key it fails to recognize from the preload; changed keys remain
+  rejected.
 - The temporary HTTP URL includes a random token. Stop the server after install.
 - The Recovery private key persists on the selected Data volume with mode `0600`.
 

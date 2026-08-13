@@ -162,7 +162,7 @@ run_endpoint()
         -o IdentitiesOnly=yes \
         -o HostKeyAlias="$CONTROLLER_HOST" \
         -o UserKnownHostsFile="$KNOWN_HOSTS" \
-        -o StrictHostKeyChecking=yes \
+        -o StrictHostKeyChecking=accept-new \
         -o ConnectTimeout=3 \
         -o ConnectionAttempts=1 \
         -o ServerAliveInterval=5 \
