@@ -98,6 +98,24 @@ kill "$HTTP_PID"
 wait "$HTTP_PID" 2>/dev/null || true
 HTTP_PID=
 
+echo "Checking Python controller HTTP fallback..."
+HTTP_PORT=$((HTTP_PORT + 1))
+"$ROOT/src/httpd.py" 127.0.0.1 "$HTTP_PORT" /test-token \
+    "$TEMP_ROOT/http-source" \
+    "http://127.0.0.1:${HTTP_PORT}/test-token" \
+    > "$TEMP_ROOT/http-python.log" 2>&1 &
+HTTP_PID=$!
+sleep 1
+curl -fsS "http://127.0.0.1:${HTTP_PORT}/test-token" \
+    -o "$TEMP_ROOT/http-python-result"
+cmp "$TEMP_ROOT/http-source" "$TEMP_ROOT/http-python-result"
+curl -fsS "http://127.0.0.1:${HTTP_PORT}/r" | \
+    TMPDIR="$TEMP_ROOT" sh > "$TEMP_ROOT/http-python-short-result"
+grep -q RECOVERY_HTTP_OK "$TEMP_ROOT/http-python-short-result"
+kill "$HTTP_PID"
+wait "$HTTP_PID" 2>/dev/null || true
+HTTP_PID=
+
 echo "Checking the loopback-only macOS nc listener form..."
 LISTENER_PORT=$((20000 + $$ % 9000))
 /usr/bin/nc -l 127.0.0.1 "$LISTENER_PORT" &

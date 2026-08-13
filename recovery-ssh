@@ -25,6 +25,9 @@ HTTP_PORT=
 TOKEN=
 HOST_KEY_FILE=
 HTTP_PID=
+NC_BIN=${RECOVERY_SSH_NC:-}
+LSOF_BIN=${RECOVERY_SSH_LSOF:-}
+HTTPD_BIN=${RECOVERY_SSH_HTTPD:-}
 
 usage()
 {
@@ -40,7 +43,7 @@ Commands:
   status     Show one computer's configuration and readiness
   list       List every configured Recovery computer
   usb-list   List active Mac USB-NCM links on the controller
-  doctor     Check required macOS tools
+  doctor     Check required controller tools
   help       Show this help
 
 Computer selection:
@@ -71,6 +74,34 @@ die()
 need_command()
 {
     command -v "$1" >/dev/null 2>&1 || die "required command is missing: $1"
+}
+
+controller_httpd_is_usable()
+{
+    candidate=$1
+    [ -x "$candidate" ] || return 1
+    if "$candidate" >/dev/null 2>&1; then
+        status=0
+    else
+        status=$?
+    fi
+    [ "$status" -eq 2 ]
+}
+
+initialize_controller_tools()
+{
+    [ -n "$NC_BIN" ] || NC_BIN=$(command -v nc 2>/dev/null || true)
+    [ -n "$LSOF_BIN" ] || LSOF_BIN=$(command -v lsof 2>/dev/null || true)
+    if [ -z "$HTTPD_BIN" ]; then
+        if controller_httpd_is_usable "$PROJECT_ROOT/dist/httpd.controller"; then
+            HTTPD_BIN="$PROJECT_ROOT/dist/httpd.controller"
+        elif [ "$(uname -s)" = Linux ] &&
+            [ -x "$PROJECT_ROOT/src/httpd.py" ]; then
+            HTTPD_BIN="$PROJECT_ROOT/src/httpd.py"
+        else
+            HTTPD_BIN="$PROJECT_ROOT/dist/httpd"
+        fi
+    fi
 }
 
 validate_name()
@@ -427,14 +458,30 @@ validate_config()
 ensure_helpers()
 {
     if [ -x "$PROJECT_ROOT/dist/ptywrap" ] &&
-        [ -x "$PROJECT_ROOT/dist/httpd" ]; then
+        [ -x "$HTTPD_BIN" ]; then
         return
     fi
 
-    need_command xcrun
     need_command make
-    echo "Building universal helper binaries..."
-    make -C "$PROJECT_ROOT" release
+    if [ "$(uname -s)" = Darwin ]; then
+        need_command xcrun
+        echo "Building universal Recovery and controller helper binaries..."
+        make -C "$PROJECT_ROOT" release controller-httpd
+    else
+        [ -x "$PROJECT_ROOT/dist/ptywrap" ] ||
+            die "dist/ptywrap must be copied from a macOS release build"
+        if command -v cc >/dev/null 2>&1 && command -v make >/dev/null 2>&1; then
+            echo "Building the native controller HTTP helper..."
+            make -C "$PROJECT_ROOT" controller-httpd
+        elif command -v python3 >/dev/null 2>&1 &&
+            [ -x "$PROJECT_ROOT/src/httpd.py" ]; then
+            HTTPD_BIN="$PROJECT_ROOT/src/httpd.py"
+            return
+        else
+            die "install make and a C compiler, or Python 3, for the controller HTTP helper"
+        fi
+    fi
+    HTTPD_BIN="$PROJECT_ROOT/dist/httpd.controller"
 }
 
 ensure_key()
@@ -459,7 +506,8 @@ install_authorized_key()
     chmod 600 "$AUTHORIZED_KEYS"
 
     public_key=$(awk '{print $1 " " $2; exit}' "$STATE_DIR/id_ed25519.pub")
-    forced_command="/usr/bin/nc -l 127.0.0.1 $LISTEN_PORT"
+    [ -x "$NC_BIN" ] || die "nc executable is missing: $NC_BIN"
+    forced_command="$NC_BIN -l 127.0.0.1 $LISTEN_PORT"
     key_line="restrict,command=\"$forced_command\" $public_key $MARKER"
 
     temp_keys=$(mktemp "${AUTHORIZED_KEYS}.XXXXXX")
@@ -616,7 +664,7 @@ print_recovery_command()
 tcp_listener_is_active()
 {
     port=$1
-    /usr/sbin/lsof -nP -a -iTCP:"$port" -sTCP:LISTEN 2>/dev/null |
+    "$LSOF_BIN" -nP -a -iTCP:"$port" -sTCP:LISTEN 2>/dev/null |
         awk 'NR > 1 {found=1} END {exit !found}'
 }
 
@@ -640,7 +688,7 @@ start_http_server()
         *) short_host=$CONTROLLER_HOST ;;
     esac
     short_installer_url="http://${short_host}:${HTTP_PORT}/${TOKEN}"
-    "$PROJECT_ROOT/dist/httpd" 0.0.0.0 "$HTTP_PORT" "/$TOKEN" \
+    "$HTTPD_BIN" 0.0.0.0 "$HTTP_PORT" "/$TOKEN" \
         "$STATE_DIR/install.sh" "$short_installer_url" &
     HTTP_PID=$!
     sleep 1
@@ -704,7 +752,7 @@ run_connect()
         done
 
         echo "Recovery connected. Attaching interactive shell..."
-        /usr/bin/nc 127.0.0.1 "$LISTEN_PORT" || true
+        "$NC_BIN" 127.0.0.1 "$LISTEN_PORT" || true
         echo
         echo "Recovery link disconnected; waiting to reattach..."
         sleep 1
@@ -742,7 +790,7 @@ run_update()
         printf "%s && RECOVERY_SSH_REQUEST_RELOAD=1 RECOVERY_SSH_INSTALL_ONLY=1 sh '%s' && printf '\\n%s\\n'; exit\n" \
             "$fetch" "$installer" "$marker"
         sleep 5
-    } | /usr/bin/nc 127.0.0.1 "$LISTEN_PORT" \
+    } | "$NC_BIN" 127.0.0.1 "$LISTEN_PORT" \
         > "$update_log" 2>&1 || true
 
     stop_http_server
@@ -869,14 +917,16 @@ run_usb_list()
 run_doctor()
 {
     failures=0
-    if [ "$(uname -s)" != Darwin ]; then
-        echo "FAIL  controller is not running macOS"
-        failures=$((failures + 1))
-    else
-        echo "OK    macOS controller"
-    fi
+    case "$(uname -s)" in
+        Darwin) echo "OK    macOS controller" ;;
+        Linux) echo "OK    Linux controller (LAN or explicit USB endpoint)" ;;
+        *)
+            echo "FAIL  unsupported controller OS: $(uname -s)"
+            failures=$((failures + 1))
+            ;;
+    esac
 
-    for command in ssh ssh-keygen ssh-keyscan nc tar cksum lsof uuidgen ioreg ifconfig; do
+    for command in ssh ssh-keygen ssh-keyscan nc tar cksum lsof uuidgen; do
         if command -v "$command" >/dev/null 2>&1; then
             echo "OK    $command"
         else
@@ -885,10 +935,25 @@ run_doctor()
         fi
     done
 
+    if [ "$(uname -s)" = Darwin ]; then
+        for command in ioreg ifconfig; do
+            if command -v "$command" >/dev/null 2>&1; then
+                echo "OK    $command"
+            else
+                echo "FAIL  $command is missing"
+                failures=$((failures + 1))
+            fi
+        done
+    fi
+
     if [ -x "$PROJECT_ROOT/dist/ptywrap" ] &&
-        [ -x "$PROJECT_ROOT/dist/httpd" ]; then
-        echo "OK    bundled helper binaries"
-    elif command -v xcrun >/dev/null 2>&1 && command -v make >/dev/null 2>&1; then
+        [ -x "$HTTPD_BIN" ]; then
+        echo "OK    Recovery and controller helpers"
+    elif [ -x "$PROJECT_ROOT/dist/ptywrap" ] &&
+        command -v cc >/dev/null 2>&1 && command -v make >/dev/null 2>&1; then
+        echo "OK    native controller HTTP helper can be built"
+    elif [ "$(uname -s)" = Darwin ] &&
+        command -v xcrun >/dev/null 2>&1 && command -v make >/dev/null 2>&1; then
         echo "OK    helpers can be built with Xcode Command Line Tools"
     else
         echo "FAIL  helper binaries and build tools are missing"
@@ -906,6 +971,7 @@ select_profile_from_args "$@"
 initialize_profile_state
 load_config
 apply_profile_defaults
+initialize_controller_tools
 
 case "$COMMAND" in
     start)

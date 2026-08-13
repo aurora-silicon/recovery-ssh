@@ -2,8 +2,9 @@ SHELL := /bin/sh
 CLANG := xcrun --sdk macosx clang
 BUILD := build
 DIST := dist
+CONTROLLER_HTTPD := $(DIST)/httpd.controller
 
-.PHONY: all clean release test
+.PHONY: all clean release controller-httpd test
 
 all: $(BUILD)/ptywrap $(BUILD)/httpd
 
@@ -38,8 +39,13 @@ release: all | $(DIST)
 	cp $(BUILD)/httpd $(DIST)/httpd
 	cd $(DIST) && shasum -a 256 ptywrap httpd > SHA256SUMS
 
+controller-httpd: $(CONTROLLER_HTTPD)
+
+$(CONTROLLER_HTTPD): src/httpd.c | $(DIST)
+	$(CC) -Os -Wall -Wextra -Werror $< -o $@
+
 test: release
 	sh tests/test.sh
 
 clean:
-	rm -rf $(BUILD) $(DIST)/ptywrap $(DIST)/httpd $(DIST)/SHA256SUMS
+	rm -rf $(BUILD) $(DIST)/ptywrap $(DIST)/httpd $(CONTROLLER_HTTPD) $(DIST)/SHA256SUMS

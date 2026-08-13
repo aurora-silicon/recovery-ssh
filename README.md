@@ -11,8 +11,9 @@ Profiles may use the normal LAN, the USB cable's CDC-NCM network link, or an
 automatic USB-first mode with LAN/Wi-Fi failover.
 
 The project is designed for both Apple silicon and Intel Recovery. Its PTY helper
-is a universal Mach-O binary, and the controller setup uses only macOS system
-tools after the included helpers have been built.
+is a universal Mach-O binary. The controller may run macOS or Linux; automatic
+Apple USB-NCM discovery is macOS-only, while Linux supports LAN and explicit
+USB endpoint configuration.
 
 ## What persists
 
@@ -151,7 +152,7 @@ when automatic interface discovery is not appropriate.
 ./recovery-ssh status    Check one named Mac profile
 ./recovery-ssh list      List all configured Recovery Macs
 ./recovery-ssh usb-list  List connected Mac USB-NCM interfaces
-./recovery-ssh doctor    Check build and macOS dependencies
+./recovery-ssh doctor    Check build and controller dependencies
 ```
 
 Common setup/start options:
@@ -204,3 +205,13 @@ make test
 ```
 
 The release build produces universal `arm64`/`x86_64` binaries in `dist/`.
+
+For a Linux controller, first copy a macOS release tree so `dist/ptywrap` is
+present. The installer server uses Python 3 when no native build toolchain is
+available; `make controller-httpd` remains available for a native C helper.
+Use LAN or an explicit USB host:
+
+```sh
+./recovery-ssh doctor
+./recovery-ssh start --name neo-j700 --transport lan --host 10.1.1.131
+```
