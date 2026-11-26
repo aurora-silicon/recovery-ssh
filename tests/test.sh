@@ -116,13 +116,14 @@ kill "$HTTP_PID"
 wait "$HTTP_PID" 2>/dev/null || true
 HTTP_PID=
 
-echo "Checking the loopback-only macOS nc listener form..."
-LISTENER_PORT=$((20000 + $$ % 9000))
-/usr/bin/nc -l 127.0.0.1 "$LISTENER_PORT" &
+echo "Checking the macOS nc listens on a Unix socket..."
+/usr/bin/nc -lU "$TEMP_ROOT/nc.sock" < /dev/null > /dev/null &
 LISTENER_PID=$!
-sleep 1
-/usr/sbin/lsof -nP -a -iTCP:"$LISTENER_PORT" -sTCP:LISTEN |
-    grep -q "127.0.0.1:${LISTENER_PORT}"
+for _wait in 1 2 3 4 5; do
+    [ -S "$TEMP_ROOT/nc.sock" ] && break
+    sleep 1
+done
+[ -S "$TEMP_ROOT/nc.sock" ]
 kill "$LISTENER_PID"
 wait "$LISTENER_PID" 2>/dev/null || true
 LISTENER_PID=
@@ -145,8 +146,8 @@ DEFAULT_STATE="$TEMP_ROOT/state/computers/default"
 DEFAULT_TOKEN=$(sed -n "s/^TOKEN='\([^']*\)'$/\1/p" "$DEFAULT_STATE/config")
 [ -n "$DEFAULT_TOKEN" ]
 grep -q 'recovery-ssh-controller:default$' "$TEMP_ROOT/authorized_keys"
-grep -q 'command="/usr/bin/nc -l 127.0.0.1 24567"' \
-    "$TEMP_ROOT/authorized_keys"
+grep -q "command=\"'$DEFAULT_STATE/relay'\"" "$TEMP_ROOT/authorized_keys"
+grep -q -- "-lU '$DEFAULT_STATE/relay.sock'" "$DEFAULT_STATE/relay"
 
 mkdir "$TEMP_ROOT/data"
 RECOVERY_SSH_VOLUME="$TEMP_ROOT/data" \
@@ -185,10 +186,8 @@ RECOVERY_SSH_AUTHORIZED_KEYS="$TEMP_ROOT/authorized_keys" \
 
 USB_STATE="$TEMP_ROOT/state/computers/m5-air"
 grep -q 'recovery-ssh-controller:m5-air$' "$TEMP_ROOT/authorized_keys"
-grep -q 'command="/usr/bin/nc -l 127.0.0.1 2223"' \
-    "$TEMP_ROOT/authorized_keys"
+grep -q "command=\"'$USB_STATE/relay'\"" "$TEMP_ROOT/authorized_keys"
 grep -q "^TRANSPORT='usb'$" "$USB_STATE/config"
-grep -q "^LISTEN_PORT='2223'$" "$USB_STATE/config"
 grep -q "^HTTP_PORT='8766'$" "$USB_STATE/config"
 if cmp -s "$DEFAULT_STATE/id_ed25519" "$USB_STATE/id_ed25519"; then
     echo "computer profiles reused the same private key" >&2
@@ -286,11 +285,6 @@ grep -q 'recovery-ssh-controller:failover-air$' "$TEMP_ROOT/authorized_keys"
 grep -q "USB: curl.*169.254.57.39" "$TEMP_ROOT/setup-auto.out"
 grep -q "LAN: curl.*192.0.2.10" "$TEMP_ROOT/setup-auto.out"
 
-AUTO_LISTEN_PORT=$(sed -n "s/^LISTEN_PORT='\([0-9][0-9]*\)'$/\1/p" \
-    "$AUTO_STATE/config")
-[ -n "$AUTO_LISTEN_PORT" ]
-[ "$AUTO_LISTEN_PORT" != 2223 ]
-
 echo "Checking controller wait-and-reattach behavior..."
 RECOVERY_SSH_HOME="$TEMP_ROOT/state" \
 RECOVERY_SSH_AUTHORIZED_KEYS="$TEMP_ROOT/authorized_keys" \
@@ -301,8 +295,7 @@ sleep 2
 kill -0 "$CONNECT_PID"
 grep -q "Waiting for 'failover-air' Recovery shell" \
     "$TEMP_ROOT/connect-auto.out"
-printf 'AUTO_REATTACH_OK\n' | \
-    /usr/bin/nc -l 127.0.0.1 "$AUTO_LISTEN_PORT" &
+printf 'AUTO_REATTACH_OK\n' | sh "$AUTO_STATE/relay" &
 LISTENER_PID=$!
 for _wait in 1 2 3 4 5; do
     grep -q AUTO_REATTACH_OK "$TEMP_ROOT/connect-auto.out" && break
@@ -322,11 +315,14 @@ if RECOVERY_SSH_HOME="$TEMP_ROOT/state" \
         --name conflicting-mac \
         --host 127.0.0.1 \
         --user testuser \
-        --listen-port 2223 \
+        --http-port 8766 \
         --host-key-file "$TEMP_ROOT/known_hosts" \
         > "$TEMP_ROOT/conflict.out" 2>&1; then
     echo "duplicate profile port was accepted" >&2
     exit 1
 fi
+
+echo "Checking the private relay and the verified bootstrap..."
+sh "$ROOT/tests/test-relay-trust.sh"
 
 echo "All Recovery SSH tests passed."

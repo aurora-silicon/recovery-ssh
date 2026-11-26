@@ -3,7 +3,8 @@
 Recovery SSH provides a persistent, interactive shell for macOS Recovery even
 when Recovery does not contain `sshd` or `ssh-keygen`. The Recovery Mac makes an
 outbound SSH connection to a controller Mac, and the controller exposes that
-shell only on `127.0.0.1`.
+shell only on a Unix socket in the profile's private state directory, which only
+the controller user can open.
 
 One controller can manage multiple Recovery Macs concurrently. Every named Mac
 profile has its own restricted key, installer, HTTP port, shell port, and state.
@@ -35,8 +36,10 @@ On the controller Mac:
    ./recovery-ssh start --name my-mac
    ```
 
-3. The command prints a single `curl` command. Run that command in the target
-   Mac's Recovery Terminal.
+3. The command prints a single `curl` command with the installer's SHA-256
+   digest in it. Type that command in the target Mac's Recovery Terminal: it
+   downloads the installer, checks the digest with Recovery's `tar`, and runs
+   the installer only if they match.
 4. Leave the Recovery Terminal open. The controller automatically attaches when
    the reverse shell is ready.
 
@@ -66,9 +69,9 @@ sh /Volumes/Data/recovery-ssh
 ```
 
 The updater transfers and overwrites the persistent launcher through the active
-Recovery shell. Installer URLs also retain the same per-computer token across
-rebuilds, and the temporary server exposes `/r` as a short emergency bootstrap
-path.
+Recovery shell. It checks the new installer's digest in Recovery before running
+it, as the first installation does. Installer URLs also retain the same
+per-computer token across rebuilds.
 
 Omitting `--name` continues to use the backward-compatible `default` profile.
 
@@ -95,8 +98,9 @@ attach to an already waiting Mac, use:
 ./recovery-ssh connect --name m5-air
 ```
 
-Explicit `--listen-port` and `--http-port` values are supported, but the command
-rejects a port already assigned to another profile.
+An explicit `--http-port` value is supported, but the command rejects a port
+already assigned to another profile. `--listen-port` is accepted for
+compatibility and ignored: the shell is relayed on a socket, not a port.
 
 ## Shell over USB
 
@@ -147,7 +151,7 @@ when automatic interface discovery is not appropriate.
 ./recovery-ssh start     Prepare, serve, wait, and attach
 ./recovery-ssh setup     Generate the key, bundle, and installer
 ./recovery-ssh serve     Serve the generated installer
-./recovery-ssh connect   Attach to the loopback-only Recovery shell
+./recovery-ssh connect   Attach to the Recovery shell relayed on this controller
 ./recovery-ssh update    Push an update through a connected Recovery shell
 ./recovery-ssh status    Check one named Mac profile
 ./recovery-ssh list      List all configured Recovery Macs
@@ -165,33 +169,38 @@ Common setup/start options:
 --usb-host ADDRESS      Explicit controller USB endpoint for auto mode
 --lan-host ADDRESS      Explicit controller LAN/Wi-Fi endpoint for auto mode
 --user USER             Controller Remote Login user
---listen-port PORT      Controller loopback shell port (default: 2222)
 --http-port PORT        Temporary installer HTTP port (default: 8765)
 --host-key-file PATH    Use a pre-collected known_hosts file
 ```
 
 Per-computer state is stored in `~/.recovery-ssh/computers/NAME` by default. Set
 `RECOVERY_SSH_HOME` to use a different base location. Legacy single-computer
-state at `~/.recovery-ssh` remains usable as the `default` profile. The short
-emergency bootstrap is safe to pipe because `/r` serves a small downloader that
-saves the self-extracting installer to `/tmp` before executing it:
+state at `~/.recovery-ssh` remains usable as the `default` profile. Keep the
+path short: the relay socket lives in the profile directory, and a socket path
+is limited to about 100 bytes.
 
-```sh
-curl CONTROLLER:PORT/r | sh
-```
+Profiles set up by an earlier version relayed the shell on a loopback TCP port.
+`connect`, `update` and `setup` rewrite their `authorized_keys` entry to the
+socket relay.
 
 ## Security model
 
 - A dedicated key is generated for each Recovery Mac; no personal SSH key is
   copied and profiles never share private keys.
-- Its `authorized_keys` entry is restricted to a forced, loopback-only `nc`
-  listener. It cannot request a controller shell, PTY, agent forwarding, or port
-  forwarding.
+- Its `authorized_keys` entry is restricted to a forced command: the profile's
+  `relay` script, which offers the Recovery shell on `relay.sock` in the
+  mode-0700 profile directory. Only the controller user (and root) can open it;
+  other local users cannot reach the shell. The key cannot request a controller
+  shell, PTY, agent forwarding, or port forwarding.
 - Controller host keys are pinned before the bundle is created. The launcher
   uses `accept-new` against only that dedicated file so Recovery OpenSSH can
   record a key it fails to recognize from the preload; changed keys remain
   rejected.
-- The temporary HTTP URL includes a random token. Stop the server after install.
+- The installer is served over plain HTTP, so it is authenticated out of band:
+  the command you type in Recovery carries its SHA-256 digest, and Recovery
+  runs the download only if the digest matches. A substituted installer is not
+  run. The URL also includes a random token; there is no unauthenticated short
+  bootstrap. Stop the server after install.
 - The Recovery private key persists on the selected Data volume with mode `0600`.
 
 Anyone who can unlock or mount that Data volume can recover the restricted key.
