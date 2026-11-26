@@ -673,15 +673,49 @@ setup_controller()
     print_recovery_command
 }
 
+file_sha256()
+{
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1"
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$1"
+    else
+        openssl dgst -sha256 -r "$1"
+    fi | awk '{print $1; exit}'
+}
+
+installer_sha256()
+{
+    digest=$(file_sha256 "$STATE_DIR/install.sh")
+    case "$digest" in
+        *[!0-9a-f]*|'') die "could not compute the installer's SHA-256 digest" ;;
+    esac
+    [ "${#digest}" -eq 64 ] || die "could not compute the installer's SHA-256 digest"
+    echo "$digest"
+}
+
+# The installer travels over plain HTTP, so Recovery runs it only if its
+# SHA-256 digest matches the one in the command the operator types from this
+# screen. Recovery's tar (libarchive, which the installer needs anyway)
+# computes the digest, as shasum may be missing there.
+verify_installer_command()
+{
+    printf "tar -cf - --format=mtree --options=sha256 -C /tmp recovery-ssh-install | grep -q 'sha256digest=%s'" "$1"
+}
+
 print_recovery_command()
 {
+    digest=$(installer_sha256)
+    verify=$(verify_installer_command "$digest")
     echo "Run this once in Recovery Terminal for '$PROFILE_NAME':"
     if [ "$TRANSPORT" = auto ]; then
-        echo "  USB: curl -fL 'http://${USB_HOST}:${HTTP_PORT}/${TOKEN}' -o /tmp/recovery-ssh-install && sh /tmp/recovery-ssh-install"
-        echo "  LAN: curl -fL 'http://${LAN_HOST}:${HTTP_PORT}/${TOKEN}' -o /tmp/recovery-ssh-install && sh /tmp/recovery-ssh-install"
+        echo "  USB: curl -fL 'http://${USB_HOST}:${HTTP_PORT}/${TOKEN}' -o /tmp/recovery-ssh-install && $verify && sh /tmp/recovery-ssh-install"
+        echo "  LAN: curl -fL 'http://${LAN_HOST}:${HTTP_PORT}/${TOKEN}' -o /tmp/recovery-ssh-install && $verify && sh /tmp/recovery-ssh-install"
     else
-        echo "  curl -fL 'http://${CONTROLLER_HOST}:${HTTP_PORT}/${TOKEN}' -o /tmp/recovery-ssh-install && sh /tmp/recovery-ssh-install"
+        echo "  curl -fL 'http://${CONTROLLER_HOST}:${HTTP_PORT}/${TOKEN}' -o /tmp/recovery-ssh-install && $verify && sh /tmp/recovery-ssh-install"
     fi
+    echo "Installer SHA-256: $digest"
+    echo "Recovery runs the download only if its digest matches."
 }
 
 tcp_listener_is_active()
@@ -716,15 +750,10 @@ http_port_is_active()
 start_http_server()
 {
     http_port_is_active && die "HTTP port $HTTP_PORT is already in use"
-    case "$TRANSPORT" in
-        # Auto mode is USB-primary. Keep the short bootstrap on USB as well;
-        # the installed launcher retains LAN as its runtime fallback.
-        auto) short_host=$USB_HOST ;;
-        *) short_host=$CONTROLLER_HOST ;;
-    esac
-    short_installer_url="http://${short_host}:${HTTP_PORT}/${TOKEN}"
+    # Only the tokenized installer is served: a short /r bootstrap would be
+    # piped to sh unverified, and would hand out the token.
     "$HTTPD_BIN" 0.0.0.0 "$HTTP_PORT" "/$TOKEN" \
-        "$STATE_DIR/install.sh" "$short_installer_url" &
+        "$STATE_DIR/install.sh" &
     HTTP_PID=$!
     sleep 1
     kill -0 "$HTTP_PID" 2>/dev/null || die "installer HTTP server failed to start"
@@ -808,6 +837,7 @@ run_update()
     trap 'stop_http_server' EXIT HUP INT TERM
 
     installer=/tmp/recovery-ssh-install
+    verify=$(verify_installer_command "$(installer_sha256)")
     marker=__RECOVERY_SSH_UPDATE_OK__
     update_log="$STATE_DIR/update.log"
     rm -f "$update_log"
@@ -825,8 +855,8 @@ run_update()
     {
         printf '\n'
         sleep 1
-        printf "%s && RECOVERY_SSH_REQUEST_RELOAD=1 RECOVERY_SSH_INSTALL_ONLY=1 sh '%s' && printf '\\n%s\\n'; exit\n" \
-            "$fetch" "$installer" "$marker"
+        printf "%s && %s && RECOVERY_SSH_REQUEST_RELOAD=1 RECOVERY_SSH_INSTALL_ONLY=1 sh '%s' && printf '\\n%s\\n'; exit\n" \
+            "$fetch" "$verify" "$installer" "$marker"
         sleep 5
     } | "$NC_BIN" -U "$RELAY_SOCKET" \
         > "$update_log" 2>&1 || true

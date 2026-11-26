@@ -322,4 +322,7 @@ if RECOVERY_SSH_HOME="$TEMP_ROOT/state" \
     exit 1
 fi
 
+echo "Checking the private relay and the verified bootstrap..."
+sh "$ROOT/tests/test-relay-trust.sh"
+
 echo "All Recovery SSH tests passed."
